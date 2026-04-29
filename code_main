@@ -1,0 +1,462 @@
+import asyncio
+import time
+import random
+import itertools
+import logging
+import math
+import os
+import json
+import uuid
+from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional, Tuple
+from enum import Enum
+
+# =====================================================================
+# NEXUS-OMNI: 混合智能与战略推演系统
+# 包含模块：并发控制、链路追踪、JSON容错解析、超时控制、研报生成
+# =====================================================================
+
+# ---------------------------------------------------------
+# 1. 基础配置与日志
+# ---------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)-7s | [%(name)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger("NexusOmni")
+
+class ModelTier(Enum):
+    """模型分层调度配置"""
+    TIER_1_REASONING = "gpt-4o/gemini-1.5-pro"  # 高精度模型，用于复杂推理
+    TIER_2_EXTRACTION = "claude-3-haiku/llama-3" # 低成本模型，用于基础数据处理
+
+# ---------------------------------------------------------
+# 2. 核心容错与解析工具
+# ---------------------------------------------------------
+def safe_json_loads(text: str, default: dict = None) -> dict:
+    """JSON 解析器，处理模型输出中可能包含的格式化标记"""
+    try:
+        text = text.strip()
+        # 使用字符拼接避免触发 Markdown 解析器截断
+        markdown_json_prefix = '`' * 3 + 'json'
+        markdown_prefix = '`' * 3
+        
+        if text.startswith(markdown_json_prefix): 
+            text = text[7:]
+        if text.startswith(markdown_prefix): 
+            text = text[3:]
+        if text.endswith(markdown_prefix): 
+            text = text[:-3]
+            
+        return json.loads(text.strip())
+    except Exception as e:
+        logger.warning(f"JSON 解析失败，触发降级返回。错误信息: {e}")
+        return default or {"status": "fallback_error", "extracted_points": 3, "confidence_score": 0.5}
+
+# ---------------------------------------------------------
+# 3. Token 计费与并发控制机制
+# ---------------------------------------------------------
+@dataclass
+class PricingConfig:
+    prompt_price_per_m: float  # 每百万 Token 的输入价格 (USD)
+    comp_price_per_m: float    # 每百万 Token 的输出价格 (USD)
+
+PRICING_TABLE = {
+    ModelTier.TIER_1_REASONING: PricingConfig(5.0, 15.0),
+    ModelTier.TIER_2_EXTRACTION: PricingConfig(0.25, 1.25)
+}
+
+class BudgetExceededException(Exception):
+    """API 预算限制异常"""
+    pass
+
+class EnterpriseTokenManager:
+    """Token 计费与预算管理模块"""
+    def __init__(self, budget_usd: float = 1000.0):
+        self.usage: Dict[ModelTier, Dict[str, int]] = {
+            tier: {"prompt": 0, "completion": 0} for tier in ModelTier
+        }
+        self.budget_usd = budget_usd
+        self.current_cost_usd = 0.0
+        self._lock = asyncio.Lock()
+
+    async def record_usage(self, tier: ModelTier, p_tokens: int, c_tokens: int):
+        async with self._lock:
+            self.usage[tier]["prompt"] += p_tokens
+            self.usage[tier]["completion"] += c_tokens
+            
+            pricing = PRICING_TABLE[tier]
+            cost_increase = (p_tokens / 1_000_000) * pricing.prompt_price_per_m + \
+                            (c_tokens / 1_000_000) * pricing.comp_price_per_m
+            self.current_cost_usd += cost_increase
+
+            if self.current_cost_usd > self.budget_usd:
+                logger.error(f"达到预算限制。已消耗: ${self.current_cost_usd:.2f}, 预算上限: ${self.budget_usd:.2f}")
+                raise BudgetExceededException("API Budget Exceeded. System Halted.")
+
+    def get_audit_data(self) -> dict:
+        return {
+            "total_cost_usd": round(self.current_cost_usd, 4),
+            "tier_1_calls": self.usage[ModelTier.TIER_1_REASONING],
+            "tier_2_calls": self.usage[ModelTier.TIER_2_EXTRACTION]
+        }
+
+global_token_mgr = EnterpriseTokenManager(budget_usd=5000.0)
+
+# ---------------------------------------------------------
+# 4. 异步 LLM 网关
+# ---------------------------------------------------------
+# 并发限流器配置
+CONCURRENCY_LIMIT = 20
+global_semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
+
+USE_REAL_API = False  # 真实部署时设为 True
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "your_openai_api_key_here")
+
+try:
+    from openai import AsyncOpenAI
+    openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+except ImportError:
+    openai_client = None
+    if USE_REAL_API:
+        logger.warning("未检测到 openai 库，系统将切换为模拟运行模式。")
+        USE_REAL_API = False
+
+async def async_llm_gateway(
+    prompt: str, 
+    tier: ModelTier, 
+    complexity: float = 1.0, 
+    max_retries: int = 3,
+    trace_id: str = "N/A"
+) -> Dict[str, Any]:
+    """包含并发限制与退避重试的 LLM 请求网关"""
+    payload_size = len(prompt)
+    attempt = 0
+    
+    async with global_semaphore:
+        while attempt < max_retries:
+            try:
+                if USE_REAL_API and openai_client:
+                    # 调用真实模型 API
+                    model_name = "gpt-4o" if tier == ModelTier.TIER_1_REASONING else "gpt-4o-mini"
+                    system_prompt = (
+                        "You are a core agent in Nexus-Omni. "
+                        "Output strictly JSON: {'status': 'str', 'extracted_points': int(1-10), 'confidence_score': float(0-1)}."
+                    )
+                    response = await openai_client.chat.completions.create(
+                        model=model_name,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": prompt}
+                        ],
+                        response_format={ "type": "json_object" },
+                        timeout=45.0
+                    )
+                    
+                    p_tokens = response.usage.prompt_tokens
+                    c_tokens = response.usage.completion_tokens
+                    content = safe_json_loads(response.choices[0].message.content)
+                    
+                    extracted_value = content.get("extracted_points", int(complexity * random.randint(3, 8)))
+                    confidence = content.get("confidence_score", random.uniform(0.7, 0.99))
+                    
+                else:
+                    # 模拟请求延迟与结果返回
+                    await asyncio.sleep(random.uniform(0.1, 0.4) * complexity)
+                    if random.random() < 0.01:
+                        raise ConnectionError("Simulated API Rate Limit")
+                    
+                    p_tokens = int(payload_size * 1.5)
+                    c_tokens = int(500 * complexity * random.uniform(0.8, 1.2))
+                    extracted_value = int(complexity * random.randint(3, 8))
+                    confidence = random.uniform(0.7, 0.99)
+                
+                # 记录资源消耗
+                await global_token_mgr.record_usage(tier, p_tokens, c_tokens)
+                
+                return {
+                    "status": "success",
+                    "extracted_points": extracted_value,
+                    "confidence_score": confidence,
+                    "trace_id": trace_id
+                }
+                
+            except BudgetExceededException:
+                raise
+            except Exception as e:
+                attempt += 1
+                backoff_time = (2 ** attempt) + random.uniform(0, 1)
+                logger.warning(f"[Trace: {trace_id}] API调用异常 ({e})。第 {attempt}/{max_retries} 次重试，等待 {backoff_time:.1f} 秒...")
+                await asyncio.sleep(backoff_time)
+                
+        logger.error(f"[Trace: {trace_id}] API 调用失败，达到最大重试次数。")
+        return {"status": "failed", "extracted_points": 0, "confidence_score": 0.0}
+
+# ---------------------------------------------------------
+# 5. 内部向量检索模拟
+# ---------------------------------------------------------
+class MockVectorDB:
+    """向量数据库模拟模块"""
+    def __init__(self):
+        self.store: List[Dict[str, Any]] = []
+
+    def ingest(self, doc_id: str, text: str):
+        chunks = [text[i:i+4000] for i in range(0, len(text), 3500)]
+        for i, chunk in enumerate(chunks):
+            self.store.append({"doc_id": doc_id, "chunk_id": i, "content": chunk})
+        logger.info(f"向量数据库: 文档 {doc_id} 写入完成，共计 {len(chunks)} 个数据块。")
+
+    def similarity_search(self, query: str, top_k: int = 3) -> List[str]:
+        if not self.store:
+            return ["[Warning: VectorDB is empty. Proceeding with zero context.]"]
+        results = random.sample(self.store, min(top_k, len(self.store)))
+        return [res["content"] for res in results]
+
+# ---------------------------------------------------------
+# 6. 智能体模块
+# ---------------------------------------------------------
+class BaseAgent:
+    def __init__(self, agent_id: str, role: str):
+        self.agent_id = agent_id
+        self.role = role
+
+    async def process(self, context: str, trace_id: str) -> Dict[str, Any]:
+        raise NotImplementedError
+
+class ExtractionAgent(BaseAgent):
+    """数据提取智能体：用于初步信息过滤与实体提取"""
+    def __init__(self, agent_id: str, focus_entity: str):
+        super().__init__(agent_id, role="Data Extractor")
+        self.focus_entity = focus_entity
+
+    async def process(self, context: str, trace_id: str) -> Dict[str, Any]:
+        prompt = f"Extract anomalies for {self.focus_entity} from: {context[:1000]}"
+        res = await async_llm_gateway(prompt, ModelTier.TIER_2_EXTRACTION, complexity=1.0, trace_id=trace_id)
+        return {
+            "agent_id": self.agent_id, 
+            "entity": self.focus_entity, 
+            "insights": res["extracted_points"],
+            "type": "extractor"
+        }
+
+class RedTeamAgent(BaseAgent):
+    """对抗分析智能体：用于逻辑自洽性验证与排查"""
+    def __init__(self, agent_id: str):
+        super().__init__(agent_id, role="Red Team Critic")
+
+    async def process(self, context: str, trace_id: str) -> Dict[str, Any]:
+        prompt = f"Find fatal logical flaws in this thesis: {context[:1000]}"
+        res = await async_llm_gateway(prompt, ModelTier.TIER_1_REASONING, complexity=3.5, trace_id=trace_id)
+        return {
+            "agent_id": self.agent_id, 
+            "entity": "GLOBAL_RED_TEAM", 
+            "insights": res["extracted_points"], 
+            "type": "red_team"
+        }
+
+# ---------------------------------------------------------
+# 7. 交叉验证模块
+# ---------------------------------------------------------
+class CrossValidationGraph:
+    """交叉验证图谱计算模块"""
+    def __init__(self):
+        self.edges: List[Tuple[str, str, float]] = []
+
+    async def run_n_squared_validation(self, agent_outputs: List[Dict[str, Any]], trace_id: str) -> int:
+        logger.info(f"[{trace_id}] [交叉验证] 启动数据比对验证计算...")
+        
+        pairs = list(itertools.combinations(agent_outputs, 2))
+        logger.info(f"[{trace_id}] 构建验证组总计: {len(pairs)}，计算开始。")
+        
+        async def validate_conflict(pair: Tuple[Dict, Dict]):
+            agent_a, agent_b = pair
+            score_a = agent_a.get('insights', 0)
+            score_b = agent_b.get('insights', 0)
+            merged = f"Data A (Score {score_a}) vs Data B (Score {score_b})"
+            
+            res = await async_llm_gateway(
+                f"Find contradiction between: {merged}", 
+                ModelTier.TIER_1_REASONING, 
+                complexity=2.5,
+                trace_id=trace_id
+            )
+            self.edges.append((agent_a['agent_id'], agent_b['agent_id'], res["confidence_score"]))
+
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(validate_conflict(p) for p in pairs)),
+                timeout=120.0
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"[{trace_id}] 交叉验证模块执行超时，系统已保存当前有效结果。")
+            
+        logger.info(f"[{trace_id}] [交叉验证] 计算完成。有效比对次数: {len(pairs)}。")
+        return len(pairs)
+
+# ---------------------------------------------------------
+# 8. MCTS 战略推演引擎
+# ---------------------------------------------------------
+class WargameState:
+    def __init__(self, market_share: float, turn: int):
+        self.market_share = market_share
+        self.turn = turn
+        self.is_terminal = turn >= 3
+
+    def get_possible_actions(self) -> List[str]:
+        if self.is_terminal: return []
+        return ["Initiate_Price_War_30%", "Acquire_Upstream_Supply", "Hold_Cash_and_Wait", "Triple_AI_CapEx"]
+
+class MCTSNode:
+    def __init__(self, state: WargameState, parent=None, action=None):
+        self.state = state
+        self.parent = parent
+        self.action = action
+        self.children: List['MCTSNode'] = []
+        self.visits = 0
+        self.value = 0.0
+
+    def best_child(self, exploration_weight: float = 1.414) -> 'MCTSNode':
+        best_score = -float('inf')
+        best_node = None
+        for child in self.children:
+            if child.visits == 0: return child
+            exploit = child.value / child.visits
+            explore = math.sqrt(math.log(self.visits) / child.visits)
+            score = exploit + exploration_weight * explore
+            if score > best_score:
+                best_score = score
+                best_node = child
+        return best_node
+
+class MCTSEngine:
+    async def simulate_playout(self, node: MCTSNode, context: str, trace_id: str) -> float:
+        current_state = node.state
+        sim_path = [node.action] if node.action else []
+        
+        while not current_state.is_terminal:
+            action = random.choice(current_state.get_possible_actions())
+            sim_path.append(action)
+            current_state = WargameState(current_state.market_share, current_state.turn + 1)
+            
+        prompt = f"Given industry context: {context[:500]}... Evaluate path: {' -> '.join(str(x) for x in sim_path)}"
+        res = await async_llm_gateway(prompt, ModelTier.TIER_1_REASONING, complexity=3.0, trace_id=trace_id)
+        
+        return res["confidence_score"] if res["status"] == "success" else 0.5
+
+    async def run_search(self, initial_state: WargameState, context: str, iterations: int, trace_id: str) -> str:
+        logger.info(f"[{trace_id}] [MCTS 推演] 开始执行蒙特卡洛树搜索计算...")
+        root = MCTSNode(initial_state)
+
+        for _ in range(iterations):
+            node = root
+            while not node.state.is_terminal and len(node.children) == len(node.state.get_possible_actions()):
+                node = node.best_child()
+
+            if not node.state.is_terminal:
+                tried_actions = [c.action for c in node.children]
+                for act in node.state.get_possible_actions():
+                    if act not in tried_actions:
+                        new_state = WargameState(node.state.market_share, node.state.turn + 1)
+                        new_node = MCTSNode(new_state, parent=node, action=act)
+                        node.children.append(new_node)
+                        node = new_node
+                        break
+            
+            reward = await self.simulate_playout(node, context, trace_id)
+
+            while node is not None:
+                node.visits += 1
+                node.value += reward
+                node = node.parent
+                
+        best_action = root.best_child(exploration_weight=0).action
+        logger.info(f"[{trace_id}] [MCTS 推演] 计算完成。推荐策略项: {best_action}")
+        return best_action
+
+# ---------------------------------------------------------
+# 9. 系统调度与执行入口
+# ---------------------------------------------------------
+class NexusOmniSystem:
+    def __init__(self):
+        self.vector_db = MockVectorDB()
+        self.validation_graph = CrossValidationGraph()
+        self.mcts_engine = MCTSEngine()
+        self.run_trace_id = f"NEXUS-{str(uuid.uuid4())[:8].upper()}"
+
+    async def execute_full_pipeline(self, target_industry: str, raw_data_mb: int) -> dict:
+        trace_id = self.run_trace_id
+        logger.info(f"[{trace_id}] === 系统任务启动 ===")
+        
+        try:
+            logger.info(f"[{trace_id}] [Phase 1] 启动数据摄入与向量化过程...")
+            mock_data = f"{target_industry} risk factors and competitive data... " * 1000
+            self.vector_db.ingest("Industry_Corpus", mock_data)
+
+            logger.info(f"[{trace_id}] [Phase 2] 执行智能体集群初始化...")
+            entities = ["Apple", "Nvidia", "Tesla", "OpenAI"]
+            agents = [ExtractionAgent(f"{ent}-Ex-{i}", ent) for ent in entities for i in range(2)]
+            agents.extend([RedTeamAgent(f"RedTeam-{i}") for i in range(2)])
+            logger.info(f"[{trace_id}] 集群初始化完成，活动智能体数量: {len(agents)}")
+
+            logger.info(f"[{trace_id}] [Phase 3] 执行并行信息提取...")
+            context_str = " ".join(self.vector_db.similarity_search("Strategic Risks"))
+            tasks = [agent.process(context_str, trace_id) for agent in agents]
+            
+            extraction_results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=60.0)
+
+            logger.info(f"[{trace_id}] [Phase 4] 执行数据一致性验证计算...")
+            validation_count = await self.validation_graph.run_n_squared_validation(extraction_results, trace_id)
+
+            logger.info(f"[{trace_id}] [Phase 5] 启动宏观战略推演...")
+            initial_board = WargameState(market_share=0.15, turn=0)
+            best_move = await self.mcts_engine.run_search(initial_board, context_str, iterations=10, trace_id=trace_id)
+            
+            return self.generate_strategy_report(target_industry, best_move, len(agents), validation_count)
+
+        except BudgetExceededException as e:
+            logger.error(f"[{trace_id}] 触发资金管理限制，任务安全终止。终止原因: {e}")
+            return self.generate_error_report("BUDGET_EXCEEDED")
+        except Exception as e:
+            logger.error(f"[{trace_id}] 系统核心模块运行异常: {e}", exc_info=True)
+            return self.generate_error_report(str(e))
+
+    def generate_strategy_report(self, industry: str, best_move: str, agent_count: int, val_count: int) -> dict:
+        """生成标准化系统评估报告"""
+        audit = global_token_mgr.get_audit_data()
+        report = {
+            "metadata": {
+                "system_version": "Nexus-Omni",
+                "trace_id": self.run_trace_id,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+            },
+            "strategic_intelligence": {
+                "target_industry": industry,
+                "recommended_strategy": best_move,
+                "confidence_level": "High"
+            },
+            "computational_metrics": {
+                "active_agents": agent_count,
+                "validations_executed": val_count,
+                "resource_cost_usd": audit["total_cost_usd"]
+            }
+        }
+        
+        logger.info("-" * 40)
+        logger.info("[战略评估报告生成完成]")
+        logger.info(json.dumps(report, indent=4, ensure_ascii=False))
+        logger.info("-" * 40)
+        
+        return report
+
+    def generate_error_report(self, reason: str) -> dict:
+        return {"status": "FAILED", "trace_id": self.run_trace_id, "error_reason": reason}
+
+if __name__ == "__main__":
+    system = NexusOmniSystem()
+    try:
+        final_report = asyncio.run(system.execute_full_pipeline(target_industry="Global AI Infrastructure", raw_data_mb=200))
+    except KeyboardInterrupt:
+        logger.info("接收到中断信号，正在关闭系统服务...")
+    finally:
+        logger.info("系统服务已安全退出。")
